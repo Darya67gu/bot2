@@ -1,0 +1,711 @@
+import asyncio
+import os
+import json
+from datetime import datetime, timedelta
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    ConversationHandler,
+    filters
+)
+
+# Конфигурация
+TOKEN = "8359184554:AAGbtfDrjt32k0BJ77OMHrentRhEnkXpjmE"
+DATA_FILE = "schedules.json"
+REMINDER_TIME_DELTA = timedelta(minutes=30)  # Напоминать за 30 минут до события
+
+# Состояния для ConversationHandler
+DATE, TIME, TEXT = range(3)
+
+# Структура для хранения расписаний
+class ScheduleManager:
+    def __init__(self):
+        self.schedules = self.load_schedules()
+    
+    def load_schedules(self):
+        """Загружаем существующие расписания из файла."""
+        if os.path.exists(DATA_FILE):
+            try:
+                with open(DATA_FILE, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception as e:
+                print(f"Ошибка загрузки расписаний: {e}")
+                return {}
+        return {}
+    
+    def save_schedules(self):
+        """Сохраняем расписания в файл."""
+        with open(DATA_FILE, 'w', encoding='utf-8') as f:
+            json.dump(self.schedules, f, ensure_ascii=False, indent=2)
+    
+    def add_schedule(self, user_id: int, date_time_str: str, schedule_text: str) -> int:
+        """Добавляет новое событие в выбранную дату и время."""
+        if str(user_id) not in self.schedules:
+            self.schedules[str(user_id)] = {}
+            
+        if date_time_str not in self.schedules[str(user_id)]:
+            self.schedules[str(user_id)][date_time_str] = {}
+        
+        # Генерируем уникальный id события
+        next_id = 1
+        existing_ids = set(map(int, self.schedules[str(user_id)][date_time_str].keys()))
+        while next_id in existing_ids:
+            next_id += 1
+        
+        self.schedules[str(user_id)][date_time_str][str(next_id)] = {
+            "text": schedule_text,
+            "date_created": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        
+        self.save_schedules()
+        return next_id
+    
+    def get_schedules_by_date(self, user_id: int, date_str: str) -> dict:
+        """Возвращает все события на указанную дату."""
+        user_schedules = self.schedules.get(str(user_id), {})
+        
+        # Ищем все события на эту дату (любое время)
+        result = {}
+        for datetime_str, events in user_schedules.items():
+            if datetime_str.startswith(date_str):
+                result.update(events)
+        
+        return result
+    
+    def get_schedules_today(self, user_id: int) -> dict:
+        """Возвращает все события на сегодня."""
+        today = datetime.now().strftime('%Y-%m-%d')
+        return self.get_schedules_by_date(user_id, today)
+    
+    def get_schedules_tomorrow(self, user_id: int) -> dict:
+        """Возвращает все события на завтра."""
+        tomorrow = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
+        return self.get_schedules_by_date(user_id, tomorrow)
+    
+    def remove_schedule(self, user_id: int, date_time_str: str, schedule_id: str) -> bool:
+        """Удаляет конкретное событие из выбранной даты и времени."""
+        schedules = self.schedules.get(str(user_id), {}).get(date_time_str, {})
+        if schedule_id in schedules:
+            del schedules[schedule_id]
+            self.save_schedules()
+            return True
+        return False
+    
+    def clear_schedules_on_date(self, user_id: int, date_str: str) -> bool:
+        """Удаляет все события на заданную дату."""
+        if str(user_id) in self.schedules:
+            # Удаляем все события, начинающиеся с этой даты
+            keys_to_remove = [k for k in self.schedules[str(user_id)].keys() if k.startswith(date_str)]
+            for key in keys_to_remove:
+                del self.schedules[str(user_id)][key]
+            self.save_schedules()
+            return True
+        return False
+
+# Менеджер расписаний
+schedule_manager = ScheduleManager()
+
+# Вспомогательные функции
+def format_schedules(schedules: dict) -> str:
+    """Форматирует список расписаний в читаемый вид."""
+    if not schedules:
+        return "Нет событий"
+    
+    result = []
+    # Сортируем по времени
+    sorted_items = sorted(
+        [(datetime_str, data) for datetime_str, events in schedules.items() for data in events.values()],
+        key=lambda x: x[0]  # Сортировка по дате-времени
+    )
+    
+    for datetime_str, data in sorted_items:
+        time_only = datetime_str.split()[1][:5] if ' ' in datetime_str else "??:??"
+        text = data["text"][:30] + ("..." if len(data["text"]) > 30 else "")
+        result.append(f"🕒 {time_only} - {text}")
+    
+    return '\n'.join(result)
+
+def format_schedules_for_date(date_schedules: dict) -> str:
+    """Форматирует расписания для конкретной даты."""
+    if not date_schedules:
+        return "Нет событий"
+    
+    result = []
+    for event_id, data in date_schedules.items():
+        text = data["text"][:40] + ("..." if len(data["text"]) > 40 else "")
+        result.append(f"ID {event_id}: {text}")
+    
+    return '\n'.join(result)
+
+def build_main_menu():
+    """Создает главное меню для быстрого доступа к командам."""
+    return ReplyKeyboardMarkup([
+        ['📅 Сегодня', '📅 Завтра'],
+        ['➕ Добавить событие', '🗑️ Удалить событие'],
+        ['📋 Все события', '🗓️ Календарь'],
+        ['❓ Помощь']
+    ], resize_keyboard=True)
+
+def create_date_keyboard():
+    """Создает клавиатуру для выбора даты."""
+    today = datetime.now()
+    
+    buttons = []
+    row = []
+    
+    # 7 дней вперед
+    for i in range(7):
+        date = today + timedelta(days=i)
+        date_str = date.strftime('%d.%m')
+        weekday = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"][date.weekday()]
+        
+        if i == 0:
+            label = f"Сегодня ({date_str})"
+        elif i == 1:
+            label = f"Завтра ({date_str})"
+        else:
+            label = f"{weekday} {date_str}"
+        
+        row.append(InlineKeyboardButton(label, callback_data=f"date_{date.strftime('%Y-%m-%d')}"))
+        
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    
+    if row:
+        buttons.append(row)
+    
+    # Кнопка для произвольной даты
+    buttons.append([InlineKeyboardButton("📅 Другая дата", callback_data="other_date")])
+    buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
+    
+    return InlineKeyboardMarkup(buttons)
+
+def create_time_keyboard():
+    """Создает клавиатуру для выбора времени."""
+    buttons = []
+    row = []
+    
+    # Часы с 8 утра до 10 вечера
+    for hour in range(8, 22):
+        for minute in [0, 30]:
+            time_str = f"{hour:02d}:{minute:02d}"
+            row.append(InlineKeyboardButton(time_str, callback_data=f"time_{time_str}"))
+            
+            if len(row) == 3:
+                buttons.append(row)
+                row = []
+    
+    if row:
+        buttons.append(row)
+    
+    buttons.append([InlineKeyboardButton("⏰ Другое время", callback_data="other_time")])
+    buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
+    
+    return InlineKeyboardMarkup(buttons)
+
+# Функция для отправки напоминания
+async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
+    job = context.job
+    user_id = job.user_id
+    event_text = job.event_text
+    reminder_time = job.reminder_time
+    
+    await context.bot.send_message(
+        chat_id=user_id, 
+        text=f"🔔 Напоминание: {event_text} в {reminder_time}",
+        parse_mode='HTML'
+    )
+
+# Команды бота
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Приветствие и помощь по работе с ботом."""
+    help_text = (
+        "👋 <b>Добро пожаловать в планировщик задач!</b>\n\n"
+        "Я помогу вам организовать ваше время и не забыть о важных событиях.\n\n"
+        "📋 <b>Основные возможности:</b>\n"
+        "• 📅 Просмотр расписания на сегодня/завтра\n"
+        "• ➕ Добавление новых событий\n"
+        "• 🗑️ Удаление событий\n"
+        "• 📋 Просмотр всех запланированных событий\n"
+        "• 🗓️ Просмотр календаря\n\n"
+        "🔔 Я буду напоминать вам о событиях за 30 минут до их начала!"
+    )
+    await update.message.reply_html(help_text, reply_markup=build_main_menu())
+
+async def show_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает расписание на сегодняшний день."""
+    user_id = update.effective_user.id
+    schedules = schedule_manager.get_schedules_today(user_id)
+    
+    today_str = datetime.now().strftime('%d.%m.%Y')
+    
+    if not schedules:
+        response = f"📅 <b>На сегодня ({today_str})</b>\n\nНет запланированных событий 😊"
+    else:
+        formatted_schedules = format_schedules(schedules)
+        response = f"📅 <b>На сегодня ({today_str})</b>\n\n{formatted_schedules}"
+    
+    await update.message.reply_html(response, reply_markup=build_main_menu())
+
+async def show_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает расписание на завтра."""
+    user_id = update.effective_user.id
+    schedules = schedule_manager.get_schedules_tomorrow(user_id)
+    
+    tomorrow = datetime.now() + timedelta(days=1)
+    tomorrow_str = tomorrow.strftime('%d.%m.%Y')
+    
+    if not schedules:
+        response = f"📅 <b>На завтра ({tomorrow_str})</b>\n\nНет запланированных событий 😊"
+    else:
+        formatted_schedules = format_schedules(schedules)
+        response = f"📅 <b>На завтра ({tomorrow_str})</b>\n\n{formatted_schedules}"
+    
+    await update.message.reply_html(response, reply_markup=build_main_menu())
+
+async def show_all_events(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает все запланированные события."""
+    user_id = update.effective_user.id
+    user_schedules = schedule_manager.schedules.get(str(user_id), {})
+    
+    if not user_schedules:
+        await update.message.reply_html("📋 У вас нет запланированных событий.", reply_markup=build_main_menu())
+        return
+    
+    response = "📋 <b>Все ваши события:</b>\n\n"
+    
+    # Сортируем даты
+    sorted_dates = sorted(user_schedules.keys())
+    
+    for date_time_str in sorted_dates:
+        date_part = date_time_str.split()[0]
+        time_part = date_time_str.split()[1][:5] if ' ' in date_time_str else ""
+        
+        date_obj = datetime.strptime(date_part, '%Y-%m-%d')
+        formatted_date = date_obj.strftime('%d.%m.%Y')
+        
+        response += f"📅 <b>{formatted_date} {time_part}</b>\n"
+        
+        events = user_schedules[date_time_str]
+        for event_id, event_data in events.items():
+            text = event_data["text"][:40] + ("..." if len(event_data["text"]) > 40 else "")
+            response += f"  • {text} (ID: {event_id})\n"
+        
+        response += "\n"
+    
+    await update.message.reply_html(response, reply_markup=build_main_menu())
+
+async def start_add_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начинает процесс добавления события."""
+    await update.message.reply_text(
+        "📅 Выберите дату события:",
+        reply_markup=create_date_keyboard()
+    )
+    return DATE
+
+async def select_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает выбор даты."""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "cancel":
+        await query.edit_message_text("❌ Добавление события отменено.")
+        return ConversationHandler.END
+    
+    elif query.data == "other_date":
+        await query.edit_message_text(
+            "📅 Введите дату в формате ДД.ММ.ГГГГ (например, 15.12.2024):"
+        )
+        return DATE
+    
+    else:
+        # Выбрана дата из клавиатуры
+        date_str = query.data.replace("date_", "")
+        context.user_data['selected_date'] = date_str
+        
+        date_obj = datetime.strptime(date_str, '%Y-%m-%d')
+        formatted_date = date_obj.strftime('%d.%m.%Y')
+        
+        await query.edit_message_text(
+            f"📅 Выбрана дата: <b>{formatted_date}</b>\n\n"
+            "⏰ Теперь выберите время:",
+            parse_mode='HTML',
+            reply_markup=create_time_keyboard()
+        )
+        return TIME
+
+async def select_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает выбор времени."""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "cancel":
+        await query.edit_message_text("❌ Добавление события отменено.")
+        return ConversationHandler.END
+    
+    elif query.data == "other_time":
+        await query.edit_message_text(
+            "⏰ Введите время в формате ЧЧ:ММ (например, 14:30):"
+        )
+        return TIME
+    
+    else:
+        # Выбрано время из клавиатуры
+        time_str = query.data.replace("time_", "")
+        context.user_data['selected_time'] = time_str
+        
+        await query.edit_message_text(
+            f"⏰ Выбрано время: <b>{time_str}</b>\n\n"
+            "📝 Теперь введите описание события:",
+            parse_mode='HTML'
+        )
+        return TEXT
+
+async def input_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает ввод даты вручную."""
+    try:
+        date_str = update.message.text.strip()
+        # Пробуем разные форматы даты
+        for fmt in ('%d.%m.%Y', '%d.%m.%y', '%d-%m-%Y', '%d/%m/%Y'):
+            try:
+                date_obj = datetime.strptime(date_str, fmt)
+                context.user_data['selected_date'] = date_obj.strftime('%Y-%m-%d')
+                
+                await update.message.reply_text(
+                    f"📅 Выбрана дата: <b>{date_obj.strftime('%d.%m.%Y')}</b>\n\n"
+                    "⏰ Теперь выберите время:",
+                    parse_mode='HTML',
+                    reply_markup=create_time_keyboard()
+                )
+                return TIME
+            except ValueError:
+                continue
+        
+        raise ValueError("Неверный формат даты")
+        
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Неверный формат даты. Попробуйте еще раз в формате ДД.ММ.ГГГГ:"
+        )
+        return DATE
+
+async def input_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает ввод времени вручную."""
+    try:
+        time_str = update.message.text.strip()
+        # Проверяем формат времени
+        datetime.strptime(time_str, '%H:%M')
+        context.user_data['selected_time'] = time_str
+        
+        await update.message.reply_text(
+            f"⏰ Выбрано время: <b>{time_str}</b>\n\n"
+            "📝 Теперь введите описание события:",
+            parse_mode='HTML'
+        )
+        return TEXT
+        
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Неверный формат времени. Попробуйте еще раз в формате ЧЧ:ММ:"
+        )
+        return TIME
+
+async def input_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает ввод описания события."""
+    event_text = update.message.text.strip()
+    
+    if not event_text:
+        await update.message.reply_text("❌ Описание события не может быть пустым. Попробуйте еще раз:")
+        return TEXT
+    
+    # Получаем выбранные дату и время
+    selected_date = context.user_data.get('selected_date')
+    selected_time = context.user_data.get('selected_time')
+    
+    if not selected_date or not selected_time:
+        await update.message.reply_text("❌ Ошибка: данные не сохранены. Начните заново.")
+        return ConversationHandler.END
+    
+    # Формируем полную дату-время
+    date_time_str = f"{selected_date} {selected_time}"
+    
+    try:
+        event_datetime = datetime.strptime(date_time_str, "%Y-%m-%d %H:%M")
+        
+        # Добавляем событие в расписание
+        user_id = update.effective_user.id
+        new_id = schedule_manager.add_schedule(user_id, date_time_str, event_text)
+        
+        # Устанавливаем напоминание
+        reminder_time = event_datetime - REMINDER_TIME_DELTA
+        context.job_queue.run_once(
+            send_reminder, 
+            when=reminder_time, 
+            chat_id=user_id, 
+            user_id=user_id, 
+            event_text=event_text, 
+            reminder_time=selected_time
+        )
+        
+        # Форматируем дату для ответа
+        date_obj = datetime.strptime(selected_date, '%Y-%m-%d')
+        formatted_date = date_obj.strftime('%d.%m.%Y')
+        
+        await update.message.reply_html(
+            f"✅ <b>Событие успешно добавлено!</b>\n\n"
+            f"📅 Дата: {formatted_date}\n"
+            f"⏰ Время: {selected_time}\n"
+            f"📝 Описание: {event_text}\n"
+            f"🔔 Напоминание за 30 минут до события",
+            reply_markup=build_main_menu()
+        )
+        
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка при добавлении события: {str(e)}")
+    
+    # Очищаем временные данные
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отменяет текущую операцию."""
+    await update.message.reply_text(
+        "❌ Операция отменена.",
+        reply_markup=build_main_menu()
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def show_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает календарь с событиями."""
+    user_id = update.effective_user.id
+    user_schedules = schedule_manager.schedules.get(str(user_id), {})
+    
+    if not user_schedules:
+        await update.message.reply_html(
+            "🗓️ <b>Ваш календарь пуст</b>\n\n"
+            "Добавьте события, чтобы они отображались здесь.",
+            reply_markup=build_main_menu()
+        )
+        return
+    
+    today = datetime.now()
+    response = "🗓️ <b>Ваш календарь:</b>\n\n"
+    
+    # Группируем события по датам
+    events_by_date = {}
+    for datetime_str, events in user_schedules.items():
+        date_part = datetime_str.split()[0]
+        if date_part not in events_by_date:
+            events_by_date[date_part] = []
+        
+        time_part = datetime_str.split()[1][:5] if ' ' in datetime_str else ""
+        for event_id, event_data in events_by_date[date_part].items():
+            events_by_date[date_part].append({
+                'time': time_part,
+                'text': event_data["text"],
+                'id': event_id
+            })
+    
+    # Сортируем даты
+    sorted_dates = sorted(events_by_date.keys())
+    
+    for date_str in sorted_dates[:10]:  # Показываем только 10 ближайших дат
+        date_obj = datetime.strptime(date_str, '%Y-%m-%d')
+        formatted_date = date_obj.strftime('%d.%m.%Y')
+        
+        # Определяем, сегодня ли это
+        if date_obj.date() == today.date():
+            date_label = f"📌 Сегодня ({formatted_date})"
+        elif date_obj.date() == (today + timedelta(days=1)).date():
+            date_label = f"📌 Завтра ({formatted_date})"
+        else:
+            date_label = f"📅 {formatted_date}"
+        
+        response += f"{date_label}\n"
+        
+        # Сортируем события по времени
+        events = sorted(events_by_date[date_str], key=lambda x: x['time'])
+        for event in events[:3]:  # Показываем только 3 события на дату
+            text = event['text'][:30] + ("..." if len(event['text']) > 30 else "")
+            response += f"  • {event['time']} - {text}\n"
+        
+        if len(events) > 3:
+            response += f"  ... и еще {len(events) - 3} событий\n"
+        
+        response += "\n"
+    
+    if len(sorted_dates) > 10:
+        response += f"\n... и еще {len(sorted_dates) - 10} дней"
+    
+    await update.message.reply_html(response, reply_markup=build_main_menu())
+
+async def start_delete_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начинает процесс удаления события."""
+    user_id = update.effective_user.id
+    user_schedules = schedule_manager.schedules.get(str(user_id), {})
+    
+    if not user_schedules:
+        await update.message.reply_html(
+            "🗑️ У вас нет событий для удаления.",
+            reply_markup=build_main_menu()
+        )
+        return
+    
+    # Создаем клавиатуру с событиями
+    buttons = []
+    
+    # Сортируем события по дате
+    sorted_dates = sorted(user_schedules.keys())
+    
+    for datetime_str in sorted_dates[:15]:  # Показываем только 15 последних событий
+        date_part = datetime_str.split()[0]
+        time_part = datetime_str.split()[1][:5] if ' ' in datetime_str else ""
+        
+        date_obj = datetime.strptime(date_part, '%Y-%m-%d')
+        formatted_date = date_obj.strftime('%d.%m')
+        
+        events = user_schedules[datetime_str]
+        for event_id, event_data in events.items():
+            text = event_data["text"][:20] + ("..." if len(event_data["text"]) > 20 else "")
+            label = f"{formatted_date} {time_part}: {text}"
+            callback_data = f"delete_{datetime_str}_{event_id}"
+            buttons.append([InlineKeyboardButton(label, callback_data=callback_data)])
+    
+    buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel_delete")])
+    
+    await update.message.reply_text(
+        "🗑️ Выберите событие для удаления:",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+async def delete_event_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает удаление события."""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "cancel_delete":
+        await query.edit_message_text("❌ Удаление отменено.")
+        return
+    
+    # Извлекаем данные для удаления
+    _, datetime_str, event_id = query.data.split('_', 2)
+    
+    user_id = update.effective_user.id
+    success = schedule_manager.remove_schedule(user_id, datetime_str, event_id)
+    
+    if success:
+        await query.edit_message_text("✅ Событие успешно удалено!")
+    else:
+        await query.edit_message_text("❌ Не удалось удалить событие.")
+
+async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает справку."""
+    help_text = (
+        "❓ <b>Справка по командам:</b>\n\n"
+        
+        "📅 <b>Основные команды:</b>\n"
+        "• <b>📅 Сегодня</b> - показать события на сегодня\n"
+        "• <b>📅 Завтра</b> - показать события на завтра\n"
+        "• <b>➕ Добавить событие</b> - добавить новое событие\n"
+        "• <b>🗑️ Удалить событие</b> - удалить существующее событие\n"
+        "• <b>📋 Все события</b> - показать все запланированные события\n"
+        "• <b>🗓️ Календарь</b> - показать календарь с событиями\n\n"
+        
+        "📝 <b>Форматы ввода:</b>\n"
+        "• Дата: ДД.ММ.ГГГГ (например, 15.12.2024)\n"
+        "• Время: ЧЧ:ММ (например, 14:30)\n\n"
+        
+        "🔔 <b>Напоминания:</b>\n"
+        "Я буду напоминать вам о событиях за 30 минут до их начала."
+    )
+    
+    await update.message.reply_html(help_text, reply_markup=build_main_menu())
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает текстовые сообщения из главного меню."""
+    text = update.message.text
+    
+    if text == "📅 Сегодня":
+        await show_today(update, context)
+    elif text == "📅 Завтра":
+        await show_tomorrow(update, context)
+    elif text == "➕ Добавить событие":
+        await start_add_event(update, context)
+    elif text == "🗑️ Удалить событие":
+        await start_delete_event(update, context)
+    elif text == "📋 Все события":
+        await show_all_events(update, context)
+    elif text == "🗓️ Календарь":
+        await show_calendar(update, context)
+    elif text == "❓ Помощь":
+        await show_help(update, context)
+    else:
+        await update.message.reply_text(
+            "Я не понимаю эту команду. Используйте кнопки меню или /help для справки.",
+            reply_markup=build_main_menu()
+        )
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик callback-запросов."""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data.startswith('delete_'):
+        await delete_event_callback(update, context)
+    else:
+        # Обработка других callback-запросов
+        pass
+
+def main():
+    """Главная функция приложения."""
+    app = Application.builder().token(TOKEN).build()
+    
+    # Создаем ConversationHandler для добавления событий
+    conv_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex('^➕ Добавить событие$'), start_add_event)],
+        states={
+            DATE: [
+                CallbackQueryHandler(select_date, pattern='^(date_|other_date|cancel)$'),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, input_date)
+            ],
+            TIME: [
+                CallbackQueryHandler(select_time, pattern='^(time_|other_time|cancel)$'),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, input_time)
+            ],
+            TEXT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, input_text)
+            ]
+        },
+        fallbacks=[CommandHandler("cancel", cancel)]
+    )
+    
+    # Регистрация обработчиков команд
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", show_help))
+    app.add_handler(CommandHandler("today", show_today))
+    app.add_handler(CommandHandler("tomorrow", show_tomorrow))
+    app.add_handler(CommandHandler("calendar", show_calendar))
+    app.add_handler(CommandHandler("all", show_all_events))
+    app.add_handler(CommandHandler("delete", start_delete_event))
+    
+    # Добавляем ConversationHandler
+    app.add_handler(conv_handler)
+    
+    # Обработчик текстовых сообщений (кнопки меню)
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
+    
+    # Обработчик inline-кнопок
+    app.add_handler(CallbackQueryHandler(button_callback))
+    
+    # Запуск бота
+    print("🤖 Бот запущен...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == '__main__':
+    main()
